@@ -1,0 +1,57 @@
+# Environment variables (contains API keys)
+.env
+.env.local
+.env.production
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs
+*.log
+logs/
+*.out
+
+# Large data files
+batch_requests.jsonl
+batch_results.jsonl
+data/
+*.csv
+*.jsonl
+
+# IDE configs
+.vscode/
+.idea/
+.claude/
+.cursor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
