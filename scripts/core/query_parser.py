@@ -1,5 +1,5 @@
 """
-Gemini-powered Natural Language Query Parser
+Gemini-powered Natural Language Query Parser with OpenAI Fallback
 Extracts structured search intent and metadata filters from recruiter queries
 """
 import os
@@ -8,6 +8,7 @@ import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from google import genai
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -17,17 +18,29 @@ class GeminiQueryParser:
 
     def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize Gemini query parser
+        Initialize query parser with Gemini and OpenAI fallback
 
         Args:
             api_key: Gemini API key (defaults to GEMINI_API_KEY env var)
         """
-        self.api_key = api_key or os.getenv('GEMINI_API_KEY')
-        if not self.api_key:
+        # Initialize Gemini
+        self.gemini_key = api_key or os.getenv('GEMINI_API_KEY')
+        if not self.gemini_key:
             raise ValueError("GEMINI_API_KEY not found in environment")
 
-        self.client = genai.Client(api_key=self.api_key)
+        self.gemini_client = genai.Client(api_key=self.gemini_key)
         logger.info("✓ Gemini query parser initialized")
+
+        # Initialize OpenAI fallback
+        self.openai_key = os.getenv('OPENAI_API_KEY')
+        self.openai_model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+
+        if self.openai_key:
+            self.openai_client = OpenAI(api_key=self.openai_key)
+            logger.info(f"✓ OpenAI fallback initialized ({self.openai_model})")
+        else:
+            self.openai_client = None
+            logger.warning("⚠ OpenAI API key not found - fallback disabled")
 
     def _parse_relative_date(self, date_string: str) -> Optional[int]:
         """
@@ -89,34 +102,9 @@ class GeminiQueryParser:
 
         return None
 
-    def parse(self, natural_query: str) -> Dict[str, Any]:
-        """
-        Parse natural language query into structured search parameters
-
-        Args:
-            natural_query: Natural language query from recruiter
-            Example: "Senior civil engineers in Manila with AutoCAD, 5+ years experience"
-
-        Returns:
-            Dictionary with:
-            - search_intent: What to search for in embeddings
-            - filters: Structured metadata filters
-
-        Example output:
-        {
-            "search_intent": "civil engineer with AutoCAD experience",
-            "filters": {
-                "min_experience": 5.0,
-                "location": "Manila, Philippines",
-                "required_skills": ["AutoCAD"],
-                "seniority_keywords": ["senior"]
-            }
-        }
-        """
-        logger.info(f"\n📝 Parsing query: '{natural_query}'")
-
-        # Build prompt for Gemini
-        prompt = f"""You are a recruiter search query parser. Extract structured search parameters from this query:
+    def _build_prompt(self, natural_query: str) -> str:
+        """Build the parsing prompt (used by both Gemini and OpenAI)"""
+        return f"""You are a recruiter search query parser. Extract structured search parameters from this query:
 
 "{natural_query}"
 
@@ -229,9 +217,71 @@ Now parse this query:
 
 Return ONLY the JSON, no other text."""
 
+    def _parse_with_openai(self, natural_query: str) -> Dict[str, Any]:
+        """Parse query using OpenAI as fallback"""
+        logger.info("🔄 Using OpenAI fallback...")
+
+        prompt = self._build_prompt(natural_query)
+
+        response = self.openai_client.chat.completions.create(
+            model=self.openai_model,
+            messages=[
+                {"role": "system", "content": "You are a recruiter search query parser. Extract structured information from natural language queries and return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+
+        response_text = response.choices[0].message.content.strip()
+
+        # Parse JSON
+        parsed = json.loads(response_text)
+
+        # Validate structure
+        if 'search_intent' not in parsed or 'filters' not in parsed:
+            raise ValueError("Missing required fields in parsed query")
+
+        # Mark that OpenAI was used
+        parsed['api_used'] = 'openai'
+        parsed['fallback_used'] = True
+
+        return parsed
+
+    def parse(self, natural_query: str) -> Dict[str, Any]:
+        """
+        Parse natural language query into structured search parameters
+
+        Args:
+            natural_query: Natural language query from recruiter
+            Example: "Senior civil engineers in Manila with AutoCAD, 5+ years experience"
+
+        Returns:
+            Dictionary with:
+            - search_intent: What to search for in embeddings
+            - filters: Structured metadata filters
+
+        Example output:
+        {
+            "search_intent": "civil engineer with AutoCAD experience",
+            "filters": {
+                "min_experience": 5.0,
+                "location": "Manila, Philippines",
+                "required_skills": ["AutoCAD"],
+                "seniority_keywords": ["senior"]
+            }
+        }
+        """
+        logger.info(f"\n📝 Parsing query: '{natural_query}'")
+
+        # Build prompt
+        prompt = self._build_prompt(natural_query)
+
+        # Try Gemini first
         try:
+            logger.info("🔵 Trying Gemini...")
             # Call Gemini
-            response = self.client.models.generate_content(
+            response = self.gemini_client.models.generate_content(
                 model='gemini-2.0-flash-001',
                 contents=prompt,
                 config={
@@ -257,7 +307,11 @@ Return ONLY the JSON, no other text."""
             if 'search_intent' not in parsed or 'filters' not in parsed:
                 raise ValueError("Missing required fields in parsed query")
 
-            logger.info("✓ Query parsed successfully")
+            # Mark that Gemini was used
+            parsed['api_used'] = 'gemini'
+            parsed['fallback_used'] = False
+
+            logger.info("✓ Query parsed successfully with Gemini")
             logger.info(f"  Search intent: '{parsed['search_intent']}'")
 
             filters = parsed['filters']
@@ -291,43 +345,107 @@ Return ONLY the JSON, no other text."""
             return parsed
 
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Gemini response as JSON: {e}")
-            logger.error(f"Response was: {response_text}")
+            logger.warning(f"⚠ Gemini JSON parsing failed: {e}")
+            if 'response_text' in locals():
+                logger.debug(f"Response was: {response_text}")
 
-            # Fallback: return query as-is with no filters
-            return {
-                "search_intent": natural_query,
-                "filters": {
-                    "min_experience": None,
-                    "max_experience": None,
-                    "location": None,
-                    "education_level": None,
-                    "required_skills": None,
-                    "seniority_keywords": None,
-                    "desired_job_titles": None,
-                    "target_companies": None,
-                    "min_date_applied": None
-                }
-            }
+            # Try OpenAI fallback
+            if self.openai_client:
+                try:
+                    parsed = self._parse_with_openai(natural_query)
+
+                    # Process filters (date parsing)
+                    filters = parsed['filters']
+                    self._process_parsed_filters(parsed, natural_query)
+
+                    logger.info("✓ Query parsed successfully with OpenAI")
+                    return parsed
+
+                except Exception as e2:
+                    logger.error(f"❌ OpenAI fallback also failed: {e2}")
+            else:
+                logger.warning("⚠ OpenAI fallback not available")
+
+            # Last resort: empty filters
+            logger.warning("⚠ Using semantic search without filters")
+            return self._empty_filters_response(natural_query)
 
         except Exception as e:
-            logger.error(f"Error parsing query with Gemini: {e}")
+            logger.warning(f"⚠ Gemini failed: {e}")
 
-            # Fallback
-            return {
-                "search_intent": natural_query,
-                "filters": {
-                    "min_experience": None,
-                    "max_experience": None,
-                    "location": None,
-                    "education_level": None,
-                    "required_skills": None,
-                    "seniority_keywords": None,
-                    "desired_job_titles": None,
-                    "target_companies": None,
-                    "min_date_applied": None
-                }
-            }
+            # Try OpenAI fallback
+            if self.openai_client:
+                try:
+                    parsed = self._parse_with_openai(natural_query)
+
+                    # Process filters (date parsing)
+                    self._process_parsed_filters(parsed, natural_query)
+
+                    logger.info("✓ Query parsed successfully with OpenAI")
+                    return parsed
+
+                except Exception as e2:
+                    logger.error(f"❌ OpenAI fallback also failed: {e2}")
+            else:
+                logger.warning("⚠ OpenAI fallback not available")
+
+            # Last resort: empty filters
+            logger.warning("⚠ Using semantic search without filters")
+            return self._empty_filters_response(natural_query)
+
+    def _process_parsed_filters(self, parsed: Dict[str, Any], natural_query: str) -> None:
+        """Process parsed filters (e.g., convert dates)"""
+        filters = parsed['filters']
+
+        # Log what was parsed
+        logger.info(f"  Search intent: '{parsed['search_intent']}'")
+
+        if filters.get('min_experience'):
+            logger.info(f"  Min experience: {filters['min_experience']} years")
+        if filters.get('max_experience'):
+            logger.info(f"  Max experience: {filters['max_experience']} years")
+        if filters.get('location'):
+            logger.info(f"  Location: {filters['location']}")
+        if filters.get('education_level'):
+            logger.info(f"  Education: {filters['education_level']}")
+        if filters.get('required_skills'):
+            logger.info(f"  Required skills: {', '.join(filters['required_skills'])}")
+        if filters.get('seniority_keywords'):
+            logger.info(f"  Seniority: {', '.join(filters['seniority_keywords'])}")
+        if filters.get('desired_job_titles'):
+            logger.info(f"  Job titles: {', '.join(filters['desired_job_titles'])}")
+        if filters.get('target_companies'):
+            logger.info(f"  Companies: {', '.join(filters['target_companies'])}")
+        if filters.get('application_date'):
+            # Convert relative date to Unix timestamp
+            date_str = filters['application_date']
+            timestamp = self._parse_relative_date(date_str)
+            if timestamp:
+                filters['min_date_applied'] = timestamp
+                date_readable = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d')
+                logger.info(f"  Applied after: {date_readable} ({date_str})")
+            # Remove the string version
+            filters.pop('application_date', None)
+
+    def _empty_filters_response(self, natural_query: str) -> Dict[str, Any]:
+        """Return a response with empty filters (last resort fallback)"""
+        return {
+            "search_intent": natural_query,
+            "filters": {
+                "min_experience": None,
+                "max_experience": None,
+                "location": None,
+                "education_level": None,
+                "required_skills": None,
+                "seniority_keywords": None,
+                "desired_job_titles": None,
+                "target_companies": None,
+                "min_date_applied": None
+            },
+            "api_used": "none",
+            "fallback_used": True,
+            "fallback_reason": "Both Gemini and OpenAI failed"
+        }
 
 
 # Test the parser

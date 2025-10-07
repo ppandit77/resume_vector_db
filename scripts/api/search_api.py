@@ -98,6 +98,9 @@ class SearchResponse(BaseModel):
     parsed_filters: Dict[str, Any]
     total_results: int
     results: List[SearchResult]
+    api_used: Optional[str] = None  # 'gemini', 'openai', or 'none'
+    fallback_used: bool = False
+    warning: Optional[str] = None
 
 
 # Endpoints
@@ -168,14 +171,29 @@ async def search_candidates(request: SearchRequest):
             explained_results.append(explained)
 
         # Build response
+        api_used = parsed_query.get('api_used', 'gemini')
+        fallback_used = parsed_query.get('fallback_used', False)
+
+        warning = None
+        if fallback_used:
+            if api_used == 'openai':
+                warning = "⚠ Gemini unavailable - using OpenAI fallback"
+            elif api_used == 'none':
+                warning = "⚠ Both Gemini and OpenAI failed - showing semantic results only"
+
         response = {
             "query": request.query,
             "parsed_filters": parsed_query['filters'],
             "total_results": len(explained_results),
-            "results": explained_results
+            "results": explained_results,
+            "api_used": api_used,
+            "fallback_used": fallback_used,
+            "warning": warning
         }
 
-        logger.info(f"✓ Returning {len(explained_results)} results")
+        logger.info(f"✓ Returning {len(explained_results)} results (API: {api_used})")
+        if warning:
+            logger.warning(warning)
         logger.info(f"{'=' * 80}\n")
 
         return response
